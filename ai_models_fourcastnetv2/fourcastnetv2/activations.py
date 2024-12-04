@@ -25,6 +25,8 @@ class ComplexReLU(nn.Module):
         self.act = nn.LeakyReLU(negative_slope=negative_slope)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
+        if self.mode != 'real':
+            raise ValueError(f'{self.mode} mode for ComplexReLU is not supported')
         if self.mode == "cartesian":
             zr = torch.view_as_real(z)
             za = self.act(zr)
@@ -50,6 +52,24 @@ class ComplexReLU(nn.Module):
 
         return out
 
+class ComplexReLU2(nn.Module):
+    def __init__(self, negative_slope=0.0, mode="real", bias_shape=None):
+        super(ComplexReLU2, self).__init__()
+
+        # store parameters
+        self.mode = mode
+        if self.mode != 'real':
+            raise ValueError(f'{self.mode} mode for ComplexReLU is not supported')
+        
+        bias = torch.zeros((1), dtype=torch.float32)
+        self.register_buffer("bias", bias)
+
+        self.negative_slope = negative_slope
+        self.act = nn.LeakyReLU(negative_slope=negative_slope)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        out = self.act(z)
+        return out
 
 class ComplexActivation(nn.Module):
     def __init__(self, activation, mode="cartesian", bias_shape=None):

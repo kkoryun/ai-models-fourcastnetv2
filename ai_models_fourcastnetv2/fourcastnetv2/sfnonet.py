@@ -30,7 +30,7 @@ from ai_models_fourcastnetv2.fourcastnetv2.layers import (
 import torch_harmonics as harmonics
 
 # to fake the sht module with ffts
-from ai_models_fourcastnetv2.fourcastnetv2.layers import RealFFT2, InverseRealFFT2
+from ai_models_fourcastnetv2.fourcastnetv2.layers import RealFFT2, InverseRealFFT2, RealSHT2, InverseRealSHT2
 
 from ai_models_fourcastnetv2.fourcastnetv2.contractions import *
 
@@ -57,9 +57,7 @@ class SpectralFilterLayer(nn.Module):
     ):
         super(SpectralFilterLayer, self).__init__()
 
-        if filter_type == "non-linear" and isinstance(
-            forward_transform, harmonics.RealSHT
-        ):
+        if filter_type == "non-linear" and isinstance(forward_transform, RealSHT2):
             self.filter = SpectralAttentionS2(
                 forward_transform,
                 inverse_transform,
@@ -87,7 +85,7 @@ class SpectralFilterLayer(nn.Module):
                 bias=False,
             )
 
-        elif filter_type == "linear" and isinstance(forward_transform, RealSHT):
+        elif filter_type == "linear" and isinstance(forward_transform, RealSHT2):
             self.filter = SpectralConvS2(
                 forward_transform,
                 inverse_transform,
@@ -362,16 +360,16 @@ class FourierNeuralOperatorNet(nn.Module):
         modes_lon = int((self.w // 2 + 1) * self.hard_thresholding_fraction)
 
         if self.spectral_transform == "sht":
-            self.trans_down = harmonics.RealSHT(
+            self.trans_down = RealSHT2(
                 *self.img_size, lmax=modes_lat, mmax=modes_lon, grid="equiangular"
             ).float()
-            self.itrans_up = harmonics.InverseRealSHT(
+            self.itrans_up = InverseRealSHT2(
                 *self.img_size, lmax=modes_lat, mmax=modes_lon, grid="equiangular"
             ).float()
-            self.trans = harmonics.RealSHT(
+            self.trans = RealSHT2(
                 self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid="legendre-gauss"
             ).float()
-            self.itrans = harmonics.InverseRealSHT(
+            self.itrans = InverseRealSHT2(
                 self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid="legendre-gauss"
             ).float()
 

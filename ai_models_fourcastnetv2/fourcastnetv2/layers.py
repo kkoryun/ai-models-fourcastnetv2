@@ -12,11 +12,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
+import torch_harmonics
 from torch.nn.modules.container import Sequential
 from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 from torch.cuda import amp
 from typing import Optional
 import math
+
+import torch_harmonics.legendre
 
 from ai_models_fourcastnetv2.fourcastnetv2.contractions import *
 from ai_models_fourcastnetv2.fourcastnetv2.activations import *
@@ -245,6 +248,210 @@ class InverseRealFFT2(nn.Module):
         # out = torch.fft.irfft2(x, dim=(-2, -1), s=(self.nlat, self.nlon), norm="ortho")
         return out
 
+
+def DirectDFT_R2C(x, norm = 'forward'):
+    norm_c = None
+    N = x.shape[-1]
+    if norm == 'forward':
+        norm_c = 1.0 / N
+    elif norm == None:
+        norm_c = None
+    else:
+        raise ValueError('Unsupported norm')
+    N = x.shape[-1]
+    X_shape = x.shape
+    x = x.view(-1, N)
+    n = torch.arange(N)
+    k = n.reshape((N, 1))
+    fi = 2 * torch.pi * k * n / N
+    x_cos = torch.cos(fi)
+    x_sin = torch.sin(fi)
+    real = torch.matmul(x, x_cos)
+    imag = torch.matmul(x, x_sin)
+    if norm_c:
+        real = real * norm_c
+        imag = imag * -norm_c
+    return real.reshape(X_shape), imag.reshape(X_shape)
+
+def InverseDFT_C2R(xr, xi, n=None, norm = 'forward'):
+    if norm != 'forward':
+        raise ValueError('Unsupported norm')
+
+    def ExtendConj(xr, xi, c=1):
+        x_conj = None
+        x_conj_r =  xr[..., 1:xr.shape[-1] - c]
+        x_conj_i = -xi[..., 1:xi.shape[-1] - c]
+        x_conj_fliped_r = torch.flip(x_conj_r, [-1])
+        x_conj_fliped_i = torch.flip(x_conj_i, [-1])
+        x_cat_r = torch.cat((xr, x_conj_fliped_r), -1)
+        x_cat_i = torch.cat((xi, x_conj_fliped_i), -1)
+        return x_cat_r, x_cat_i
+
+    if not n:
+        n = xr.shape[-1]
+        xr, xi = ExtendConj(xr[...,:n], xi[...,:n])
+    elif xr.shape[-1] >= n:
+        c = 0 if n % 2 else 1
+        xr, xi = ExtendConj(xr[...,:n//2+1], xi[...,:n//2+1], c)
+    elif xr.shape[-1] < n:
+        shape = list(xr.shape)
+        shape[-1] = n - xr.shape[-1]
+        xr = torch.cat((xr, torch.zeros(shape)), -1)
+        xi = torch.cat((xi, torch.zeros(shape)), -1)
+        c = 0 if n % 2 else 1
+        xr, xi = ExtendConj(xr[...,:n//2 + 1], xi[...,:n//2 + 1], c)
+        
+    N = xr.shape[-1]
+    X_shape = xr.shape
+    xr = xr.view(-1, N)
+    xi = xi.view(-1, N)
+    
+    n = torch.arange(N)
+    k = n.reshape((N, 1))
+    fi = 2 * torch.pi * k * n / N
+    x_cos = torch.cos(fi)
+    x_sin = torch.sin(fi)
+    
+    X_cos = torch.matmul(xr, x_cos)
+    X_sin = torch.matmul(xi, x_sin)
+    real = X_cos - X_sin
+
+    # X_cos = torch.matmul(xi, x_cos)
+    # X_sin = torch.matmul(xr, x_sin)
+    # imag = X_cos + X_sin
+    
+    return real.reshape(X_shape)#, imag.reshape(X_shape)
+
+class RealSHT2(nn.Module):
+    r"""
+    Custom implementation of torch_harmonics.RealSHT
+    """
+
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="lobatto", norm="ortho", csphase=True):
+        super().__init__()
+
+        self.nlat = nlat
+        self.nlon = nlon
+        self.grid = grid
+        self.norm = norm
+        self.csphase = csphase
+
+        # TODO: include assertions regarding the dimensions
+
+        # compute quadrature points
+        if self.grid == "legendre-gauss":
+            cost, w = torch_harmonics.quadrature.legendre_gauss_weights(nlat, -1, 1)
+            self.lmax = lmax or self.nlat
+        elif self.grid == "lobatto":
+            cost, w = torch_harmonics.quadrature.lobatto_weights(nlat, -1, 1)
+            self.lmax = lmax or self.nlat-1
+        elif self.grid == "equiangular":
+            cost, w = torch_harmonics.quadrature.clenshaw_curtiss_weights(nlat, -1, 1)
+            # cost, w = fejer2_weights(nlat, -1, 1)
+            self.lmax = lmax or self.nlat
+        else:
+            raise(ValueError("Unknown quadrature mode"))
+
+        # apply cosine transform and flip them
+        tq = np.flip(np.arccos(cost))
+
+        # determine the dimensions 
+        self.mmax = mmax or self.nlon // 2 + 1
+
+        # combine quadrature weights with the legendre weights
+        weights = torch.from_numpy(w)
+        pct = torch_harmonics.legendre.precompute_legpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
+        weights = torch.einsum('mlk,k->mlk', pct, weights)
+
+        # remember quadrature weights
+        self.register_buffer('weights', weights, persistent=False)
+
+    def extra_repr(self):
+        return f'nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}'
+
+    def forward(self, x: torch.Tensor):
+
+        assert(x.shape[-2] == self.nlat)
+        assert(x.shape[-1] == self.nlon)
+
+        # apply real fft in the longitudinal direction
+        x_r, x_i = DirectDFT_R2C(x, norm="forward")
+        x_r = 2.0 * torch.pi * x_r
+        x_i = 2.0 * torch.pi * x_i
+        
+        # distributed contraction: fork
+        out_shape = list(x.size())
+        out_shape[-2] = self.lmax
+        out_shape[-1] = self.mmax
+        xout_r = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+        xout_i = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+        
+        # contraction
+        xout_r[...] = torch.einsum('...km,mlk->...lm', x_r[..., :self.mmax], self.weights.to(x.dtype) )
+        xout_i[...] = torch.einsum('...km,mlk->...lm', x_i[..., :self.mmax], self.weights.to(x.dtype) )
+
+        return xout_r, xout_i
+
+class InverseRealSHT2(nn.Module):
+    r"""
+    Custom implementation of torch_harmonics.InverseRealSHT
+    """
+
+    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="lobatto", norm="ortho", csphase=True):
+
+        super().__init__()
+
+        self.nlat = nlat
+        self.nlon = nlon
+        self.grid = grid
+        self.norm = norm
+        self.csphase = csphase
+
+        # compute quadrature points
+        if self.grid == "legendre-gauss":
+            cost, _ = torch_harmonics.quadrature.legendre_gauss_weights(nlat, -1, 1)
+            self.lmax = lmax or self.nlat
+        elif self.grid == "lobatto":
+            cost, _ = torch_harmonics.quadrature.lobatto_weights(nlat, -1, 1)
+            self.lmax = lmax or self.nlat-1
+        elif self.grid == "equiangular":
+            cost, _ = torch_harmonics.quadrature.clenshaw_curtiss_weights(nlat, -1, 1)
+            self.lmax = lmax or self.nlat
+        else:
+            raise(ValueError("Unknown quadrature mode"))
+
+        # apply cosine transform and flip them
+        t = np.flip(np.arccos(cost))
+
+        # determine the dimensions 
+        self.mmax = mmax or self.nlon // 2 + 1
+
+        pct = torch_harmonics.legendre.precompute_legpoly(self.mmax, self.lmax, t, norm=self.norm, inverse=True, csphase=self.csphase)
+
+        # register buffer
+        self.register_buffer('pct', pct, persistent=False)
+
+    def extra_repr(self):
+        r"""
+        Pretty print module
+        """
+        return f'nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}'
+
+    def forward(self, xr: torch.Tensor, xi: torch.Tensor):
+
+        assert(xr.shape[-2] == self.lmax)
+        assert(xr.shape[-1] == self.mmax)
+        
+        # Evaluate associated Legendre functions on the output nodes
+        rl = torch.einsum('...lm, mlk->...km', xr, self.pct.to(xr.dtype) )
+        im = torch.einsum('...lm, mlk->...km', xi, self.pct.to(xi.dtype) )
+        # apply the inverse (real) FFT
+        xr = InverseDFT_C2R(rl, im, n=self.nlon)
+        return xr
+
+    
+# RealSHT2 = torch_harmonics.RealSHT
+# InverseRealSHT2 = torch_harmonics.InverseRealSHT
 
 class SpectralConv2d(nn.Module):
     """
@@ -566,8 +773,8 @@ class SpectralAttentionS2(nn.Module):
         self.modes_lon = forward_transform.mmax
 
         # only storing the forward handle to be able to call it
-        self.forward_transform = forward_transform.forward
-        self.inverse_transform = inverse_transform.forward
+        self.forward_transform = forward_transform
+        self.inverse_transform = inverse_transform
 
         assert inverse_transform.lmax == self.modes_lat
         assert inverse_transform.mmax == self.modes_lon
@@ -593,7 +800,10 @@ class SpectralAttentionS2(nn.Module):
 
         self.drop = nn.Dropout(drop_rate) if drop_rate > 0.0 else nn.Identity()
 
-        self.activation = ComplexReLU(
+        # self.activation = ComplexReLU(
+        #     mode=complex_activation, bias_shape=(self.hidden_size, 1, 1)
+        # )
+        self.activation = ComplexReLU2(
             mode=complex_activation, bias_shape=(self.hidden_size, 1, 1)
         )
 
@@ -615,7 +825,32 @@ class SpectralAttentionS2(nn.Module):
 
         return xr
 
-    def forward(self, x):
+    def forward_mlp2(self, xr, xi):
+        for l in range(self.spectral_layers):
+            if hasattr(self, "b"):
+                raise ValueError('mul_add_handle not supported')
+
+            yr = self.w[l][..., 0]
+            yi = self.w[l][..., 1]
+            zr = torch.einsum("bixy,io->boxy", xr, yr) - torch.einsum("bixy,io->boxy", xi, yi)
+            zi = torch.einsum("bixy,io->boxy", xr, yi) + torch.einsum("bixy,io->boxy", xi, yr)
+            # zr = torch.nn.functional.leaky_relu(zr, negative_slope=0.0)
+            zr = self.activation(zr)
+            zr = self.drop(zr)
+            # apply dropout to imag values
+            zi = (zr != 0).to(torch.float) * zi
+            xr = zr
+            xi = zi
+        
+        # final MLP
+        yr = self.wout[..., 0]
+        yi = self.wout[..., 1]
+        zr = torch.einsum("bixy,io->boxy", xr, yr) - torch.einsum("bixy,io->boxy", xi, yi)
+        zi = torch.einsum("bixy,io->boxy", xr, yi) + torch.einsum("bixy,io->boxy", xi, yr)
+        
+        return zr, zi
+    
+    def forward_(self, x):
         dtype = x.dtype
         # x = x.to(torch.float32)
 
@@ -635,3 +870,27 @@ class SpectralAttentionS2(nn.Module):
             x = x.to(dtype)
 
         return x
+    
+    def forward(self, x):
+        dtype = x.dtype
+        # x = x.to(torch.float32)
+
+        # FWD transform
+        xr = None
+        xi = None
+        with amp.autocast(enabled=False):
+            x = x.to(torch.float32)
+            xr, xi = self.forward_transform(x)
+        # xs = torch.stack((xr, xi), -1)
+        # torch.save(xs, 'cust_t_1.pt')
+        # MLP
+        xr, xi = self.forward_mlp2(xr, xi)
+        # xs = torch.stack((xr, xi), -1)
+        # torch.save(xs, 'cust_t_2.pt')
+        # BWD transform
+        with amp.autocast(enabled=False):
+            xr = self.inverse_transform(xr, xi)
+            xr = xr.to(dtype)
+        # torch.save(xr, 'cust_t_3.pt')
+        return xr
+
