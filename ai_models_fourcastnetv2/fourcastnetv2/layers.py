@@ -264,6 +264,7 @@ def DirectDFT_R2C(x, norm = 'forward'):
     n = torch.arange(N)
     k = n.reshape((N, 1))
     fi = 2 * torch.pi * k * n / N
+    fi = fi.to(x.device)
     x_cos = torch.cos(fi)
     x_sin = torch.sin(fi)
     real = torch.matmul(x, x_cos)
@@ -296,8 +297,8 @@ def InverseDFT_C2R(xr, xi, n=None, norm = 'forward'):
     elif xr.shape[-1] < n:
         shape = list(xr.shape)
         shape[-1] = n - xr.shape[-1]
-        xr = torch.cat((xr, torch.zeros(shape)), -1)
-        xi = torch.cat((xi, torch.zeros(shape)), -1)
+        xr = torch.cat((xr, torch.zeros(shape).to(xr.device)), -1)
+        xi = torch.cat((xi, torch.zeros(shape).to(xi.device)), -1)
         c = 0 if n % 2 else 1
         xr, xi = ExtendConj(xr[...,:n//2 + 1], xi[...,:n//2 + 1], c)
         
@@ -309,6 +310,7 @@ def InverseDFT_C2R(xr, xi, n=None, norm = 'forward'):
     n = torch.arange(N)
     k = n.reshape((N, 1))
     fi = 2 * torch.pi * k * n / N
+    fi = fi.to(xr.device)
     x_cos = torch.cos(fi)
     x_sin = torch.sin(fi)
     
